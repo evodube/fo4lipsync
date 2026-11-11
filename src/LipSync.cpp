@@ -9,7 +9,7 @@ namespace LipSync
 		using clock = std::chrono::steady_clock;
 
 		// ------------------------------------------------------------------
-		// Engine layouts (old-gen 1.10.163)
+		// Engine layouts (same on 1.10.163, 1.10.980/984 and 1.11.x)
 		// ------------------------------------------------------------------
 
 		// Lip file data the engine plays for the current line.
@@ -294,7 +294,7 @@ namespace LipSync
 				if (g_badSamples.fetch_add(1) + 1 >= 20) {
 					g_disabled = true;
 					logger::error(
-						"lip data didn't look like 1.10.163's layout 20 times in a row - turning the fix off for this session");
+						"lip data didn't match the expected layout for this game version 20 times in a row - turning the fix off for this session");
 				}
 				return;
 			}

@@ -25,6 +25,9 @@ jobs:
             ${{ env.LOCALAPPDATA }}/.xmake/packages
           key: xmake-${{ runner.os }}-${{ hashFiles('xmake.lua', 'extern/CommonLibF4/xmake.lua') }}
 
+      - name: Patch CommonLibF4 (1.11.x runtimes are next-gen)
+        run: git -C extern/CommonLibF4 apply ../../patches/commonlibf4-1.11-runtime.patch
+
       - name: Configure
         run: xmake f -m releasedbg -a x64 -y
 

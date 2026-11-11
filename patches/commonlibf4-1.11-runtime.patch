@@ -1,0 +1,13 @@
+diff --git a/CommonLibF4/src/REL/Module.cpp b/CommonLibF4/src/REL/Module.cpp
+index dbd105e5..591ce425 100644
+--- a/CommonLibF4/src/REL/Module.cpp
++++ b/CommonLibF4/src/REL/Module.cpp
+@@ -52,7 +52,7 @@ namespace REL
+ 				_runtime = Runtime::VR;
+ 				break;
+ 			default:
+-				_runtime = (_version[2] > 163) ? Runtime::NG : Runtime::F4;
++				_runtime = (_version[1] > 10 || _version[2] > 163) ? Runtime::NG : Runtime::F4;
+ 			}
+ 			return;
+ 		}
