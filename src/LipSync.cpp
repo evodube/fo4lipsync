@@ -101,6 +101,24 @@ namespace LipSync
 			return kernel;
 		}
 
+		// Fingerprint of a lip anim's phoneme data, so data we already blurred
+		// (the engine reusing a cached line, or two actors sharing one) isn't
+		// blurred again.
+		std::uint64_t Fingerprint(const LipSynchAnim* a_anim)
+		{
+			const std::size_t count = static_cast<std::size_t>(a_anim->numFrames) * a_anim->numPhonemeTargets;
+			std::uint64_t     hash = 0xcbf29ce484222325ull;
+			hash = (hash ^ reinterpret_cast<std::uintptr_t>(a_anim->phonemes)) * 0x100000001b3ull;
+			hash = (hash ^ count) * 0x100000001b3ull;
+			const auto* bytes = reinterpret_cast<const std::uint8_t*>(a_anim->phonemes);
+			for (std::size_t i = 0; i < count * sizeof(float); ++i) {
+				hash = (hash ^ bytes[i]) * 0x100000001b3ull;
+			}
+			return hash;
+		}
+
+		std::unordered_set<std::uint64_t> g_smoothedPrints;
+
 		// Returns false when the data layout isn't one we recognise (left untouched).
 		bool SmoothAnim(LipSynchAnim* a_anim)
 		{
@@ -121,21 +139,31 @@ namespace LipSync
 			const float                            strength = Settings::fSmoothing;
 
 			const auto stride = rows[1] - rows[0];
-			if (stride == static_cast<std::ptrdiff_t>(frames)) {
-				// one contiguous curve per phoneme target
-				for (std::size_t t = 0; t < targets; ++t) {
-					SmoothCurve(base + t * frames, frames, 1, kernel, strength, scratch);
-				}
-				return true;
+			const bool perTarget = stride == static_cast<std::ptrdiff_t>(frames);
+			const bool perFrame = stride == static_cast<std::ptrdiff_t>(targets);
+			if (!perTarget && !perFrame) {
+				return false;
 			}
-			if (stride == static_cast<std::ptrdiff_t>(targets)) {
-				// one row of target weights per frame
-				for (std::size_t t = 0; t < targets; ++t) {
+
+			if (g_smoothedPrints.contains(Fingerprint(a_anim))) {
+				return true;  // already smoothed
+			}
+
+			for (std::size_t t = 0; t < targets; ++t) {
+				if (perTarget) {
+					// one contiguous curve per phoneme target
+					SmoothCurve(base + t * frames, frames, 1, kernel, strength, scratch);
+				} else {
+					// one row of target weights per frame
 					SmoothCurve(base + t, frames, targets, kernel, strength, scratch);
 				}
-				return true;
 			}
-			return false;
+
+			if (g_smoothedPrints.size() > 4096) {
+				g_smoothedPrints.clear();
+			}
+			g_smoothedPrints.insert(Fingerprint(a_anim));
+			return true;
 		}
 
 		// ------------------------------------------------------------------
@@ -295,7 +323,13 @@ namespace LipSync
 				}
 			}
 
-			const float realDt = std::chrono::duration<float>(now - state.last).count();
+			// Real time scaled by the game's slow-motion multiplier (VATS, Jet...),
+			// which slows the voice audio too.
+			float timeMult = RE::BSTimer::QGlobalTimeMultiplier();
+			if (!(timeMult > 0.0f && timeMult <= 10.0f)) {
+				timeMult = 1.0f;
+			}
+			const float realDt = std::chrono::duration<float>(now - state.last).count() * timeMult;
 			state.last = now;
 
 			if (Settings::bFixLipTime) {
