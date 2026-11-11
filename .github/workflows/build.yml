@@ -1,0 +1,46 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: xmake-io/github-action-setup-xmake@v1
+        with:
+          xmake-version: latest
+
+      - name: Cache xmake packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.LOCALAPPDATA }}/.xmake/packages
+          key: xmake-${{ runner.os }}-${{ hashFiles('xmake.lua', 'extern/CommonLibF4/xmake.lua') }}
+
+      - name: Configure
+        run: xmake f -m releasedbg -a x64 -y
+
+      - name: Build
+        run: xmake build -y -v fo4lipsync
+
+      - name: Stage mod
+        shell: pwsh
+        run: |
+          $out = "mod/Data/F4SE/Plugins"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          Copy-Item build/windows/x64/releasedbg/fo4lipsync.dll $out
+          Copy-Item build/windows/x64/releasedbg/fo4lipsync.pdb $out -ErrorAction SilentlyContinue
+          Copy-Item dist/F4SE/Plugins/fo4lipsync.ini $out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fo4lipsync
+          path: mod
