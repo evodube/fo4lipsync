@@ -212,44 +212,48 @@ namespace LipSync
 		//
 		// HighProcessData's layout differs between runtimes, so instead of trusting
 		// fixed offsets we find the lip data at runtime: scan a talking actor's
-		// HighProcessData for a pointer with LipSynchAnim's exact signature, then
-		// confirm it by watching the lip time stored right after it (+8) advance
-		// over several frames. Nothing is written until an offset is confirmed.
+		// HighProcessData for pointers shaped like LipSynchAnim, then watch the
+		// floats stored just after each one; the one that runs forward like a clock
+		// for several frames while the pointer stays put is the lip time. Nothing
+		// is written until both offsets are confirmed.
 
-		constexpr std::ptrdiff_t kScanBegin = 0x200;
+		constexpr std::ptrdiff_t kScanBegin = 0x0;
 		constexpr std::ptrdiff_t kScanEnd = 0x800;
-		constexpr std::ptrdiff_t kLipTimeAfterAnim = 0x8;           // lipTime follows lipSynchAnim
+		constexpr std::ptrdiff_t kClockSearch = 0x20;  // look for the lip time this far past the pointer
 		constexpr std::ptrdiff_t kVoiceBeforeAnim = kHigh_LipSynchAnim - kHigh_VoiceTimer;  // 0xB0 on 1.11.x
 
-		std::atomic<std::ptrdiff_t> g_lipOffset{ -1 };    // confirmed lipSynchAnim offset
-		std::atomic<std::ptrdiff_t> g_voiceOffset{ -1 };  // confirmed voiceTimer offset
+		std::atomic<std::ptrdiff_t> g_lipOffset{ -1 };      // confirmed lipSynchAnim offset
+		std::atomic<std::ptrdiff_t> g_lipTimeOffset{ -1 };  // confirmed lipTime offset
+		std::atomic<std::ptrdiff_t> g_voiceOffset{ -1 };    // confirmed voiceTimer offset
 		std::atomic<bool>           g_voiceGaveUp{ false };
 
-		// Stricter than PlausibleAnim: used while hunting through unknown fields.
+		// Loose shape check used both while hunting and to validate each new line.
 		bool LooksLikeLipAnim(const void* a_ptr)
 		{
 			if (!PlausiblePointer(a_ptr) || !Accessible(a_ptr, sizeof(LipSynchAnim), false)) {
 				return false;
 			}
 			const auto* anim = static_cast<const LipSynchAnim*>(a_ptr);
-			if (!PlausibleAnim(anim) || anim->numPhonemeTargets < 2 || anim->versionNumber > 64) {
-				return false;
-			}
-			if (!PlausiblePointer(anim->p_phonemes) || !PlausiblePointer(anim->phonemes) ||
-			    !Accessible(anim->p_phonemes, sizeof(float*) * 2, false) || anim->p_phonemes[0] != anim->phonemes) {
-				return false;
-			}
-			const auto stride = anim->p_phonemes[1] - anim->p_phonemes[0];
-			return stride == static_cast<std::ptrdiff_t>(anim->numFrames) ||
-			       stride == static_cast<std::ptrdiff_t>(anim->numPhonemeTargets);
+			return PlausibleAnim(anim) &&
+			       anim->versionNumber <= 64 &&
+			       PlausiblePointer(anim->p_phonemes) &&
+			       (anim->phonemes == nullptr || PlausiblePointer(anim->phonemes)) &&
+			       Accessible(anim->p_phonemes, sizeof(float*), false);
 		}
+
+		struct Clock
+		{
+			std::ptrdiff_t offset;
+			float          last;
+			int            hits;
+			bool           dead;
+		};
 
 		struct Candidate
 		{
-			std::ptrdiff_t offset;
-			const void*    anim;
-			float          lipTime;
-			int            hits;
+			std::ptrdiff_t     offset;
+			const void*        anim;
+			std::vector<Clock> clocks;
 		};
 
 		struct Probe
@@ -258,12 +262,55 @@ namespace LipSync
 			clock::time_point      lastScan{};
 		};
 
+		struct DiscoveryStats
+		{
+			std::uint64_t scans{ 0 };
+			std::uint64_t shapeMatches{ 0 };
+			std::uint64_t droppedPointerChanged{ 0 };
+			std::uint64_t droppedNoClock{ 0 };
+			std::uint32_t samplesLogged{ 0 };
+			std::set<std::ptrdiff_t> sampledOffsets;
+		};
+
 		std::unordered_map<RE::Actor*, Probe> g_probes;
 		clock::time_point                     g_lastAnyScan{};
 		clock::time_point                     g_discoveryStart{};
-		bool                                  g_reportedNoLuck{ false };
+		clock::time_point                     g_lastStatsLog{};
+		DiscoveryStats                        g_stats;
 
-		// Returns true once the lip offset is known.
+		void LogSample(RE::Actor* a_actor, void* a_high, std::ptrdiff_t a_offset, const LipSynchAnim* a_anim)
+		{
+			if (g_stats.samplesLogged >= 12 || !g_stats.sampledOffsets.insert(a_offset).second) {
+				return;
+			}
+			++g_stats.samplesLogged;
+
+			std::string floats;
+			for (auto o = a_offset + 8; o < a_offset + 8 + kClockSearch; o += 4) {
+				floats += std::format(" +0x{:X}={:g}", o - a_offset, Field<float>(a_high, o));
+			}
+			const auto stride = a_anim->phonemes && Accessible(a_anim->p_phonemes, sizeof(float*) * 2, false) ?
+			                        a_anim->p_phonemes[1] - a_anim->p_phonemes[0] :
+			                        0;
+			logger::info(
+				"probe: actor {:08X} +0x{:X} -> frames {} start {} targets {} version {} gestures {} rows[0]==data {} stride {} | after:{}",
+				a_actor->formID, a_offset, a_anim->numFrames, a_anim->startingFrame, a_anim->numPhonemeTargets,
+				a_anim->versionNumber, a_anim->hasGestures,
+				a_anim->phonemes && a_anim->p_phonemes[0] == a_anim->phonemes, stride, floats);
+		}
+
+		void LogStats(clock::time_point a_now)
+		{
+			if (a_now - g_lastStatsLog < 60s) {
+				return;
+			}
+			g_lastStatsLog = a_now;
+			logger::info(
+				"still looking for lip data: {} scans, {} lip-shaped pointers, dropped {} (pointer changed) / {} (no running clock next to it)",
+				g_stats.scans, g_stats.shapeMatches, g_stats.droppedPointerChanged, g_stats.droppedNoClock);
+		}
+
+		// Returns true once the lip offsets are known.
 		bool Discover(RE::Actor* a_actor, void* a_high, clock::time_point a_now)
 		{
 			if (g_lipOffset >= 0) {
@@ -271,33 +318,53 @@ namespace LipSync
 			}
 			if (g_discoveryStart == clock::time_point{}) {
 				g_discoveryStart = a_now;
+				g_lastStatsLog = a_now;
 			}
+			LogStats(a_now);
 
 			auto& probe = g_probes[a_actor];
 
 			// follow up on candidates from an earlier scan
 			if (!probe.candidates.empty()) {
 				std::erase_if(probe.candidates, [&](Candidate& c) {
-					const auto* anim = Field<const void*>(a_high, c.offset);
-					const float lip = Field<float>(a_high, c.offset + kLipTimeAfterAnim);
-					if (anim != c.anim || !std::isfinite(lip) || lip < c.lipTime - 0.001f || lip - c.lipTime > 1.0f) {
-						return true;  // line changed or the float isn't a forward-running clock
+					if (Field<const void*>(a_high, c.offset) != c.anim) {
+						++g_stats.droppedPointerChanged;
+						return true;
 					}
-					if (lip > c.lipTime) {
-						++c.hits;
+					bool anyAlive = false;
+					for (auto& k : c.clocks) {
+						if (k.dead) {
+							continue;
+						}
+						const float v = Field<float>(a_high, k.offset);
+						if (!std::isfinite(v) || v < k.last - 0.001f || v - k.last > 1.0f) {
+							k.dead = true;
+							continue;
+						}
+						if (v > k.last) {
+							++k.hits;
+						}
+						k.last = v;
+						anyAlive = true;
 					}
-					c.lipTime = lip;
+					if (!anyAlive) {
+						++g_stats.droppedNoClock;
+						return true;
+					}
 					return false;
 				});
 
 				for (const auto& c : probe.candidates) {
-					if (c.hits >= 4) {
-						g_lipOffset = c.offset;
-						logger::info(
-							"found lip data at HighProcessData+0x{:X} (1.11.x layout has it at +0x{:X})",
-							c.offset, kHigh_LipSynchAnim);
-						g_probes.clear();
-						return true;
+					for (const auto& k : c.clocks) {
+						if (!k.dead && k.hits >= 4) {
+							g_lipTimeOffset = k.offset;
+							g_lipOffset = c.offset;
+							logger::info(
+								"found lip data at HighProcessData+0x{:X}, lip time at +0x{:X} (1.11.x layout: +0x{:X} / +0x{:X})",
+								c.offset, k.offset, kHigh_LipSynchAnim, kHigh_LipSynchAnim + 8);
+							g_probes.clear();
+							return true;
+						}
 					}
 				}
 				if (!probe.candidates.empty()) {
@@ -305,30 +372,36 @@ namespace LipSync
 				}
 			}
 
-			// scan this actor (throttled: one scan per actor per 0.25s, one per frame overall)
+			// scan this actor (throttled: one scan per actor per 0.25s, at most one every 5ms overall)
 			if (a_now - probe.lastScan < 250ms || a_now - g_lastAnyScan < 5ms) {
 				return false;
 			}
 			probe.lastScan = a_now;
 			g_lastAnyScan = a_now;
+			++g_stats.scans;
 
-			if (!Accessible(static_cast<std::byte*>(a_high) + kScanBegin, kScanEnd - kScanBegin, false)) {
+			if (!Accessible(static_cast<std::byte*>(a_high) + kScanBegin, kScanEnd + kClockSearch + 8 - kScanBegin, false)) {
 				return false;
 			}
 
-			for (auto off = kScanBegin; off + kLipTimeAfterAnim + 4 <= kScanEnd; off += 8) {
+			for (auto off = kScanBegin; off < kScanEnd; off += 8) {
 				const auto* ptr = Field<const void*>(a_high, off);
-				if (LooksLikeLipAnim(ptr)) {
-					const float lip = Field<float>(a_high, off + kLipTimeAfterAnim);
-					if (std::isfinite(lip) && lip >= 0.0f && lip < 3600.0f) {
-						probe.candidates.push_back({ off, ptr, lip, 0 });
+				if (!LooksLikeLipAnim(ptr)) {
+					continue;
+				}
+				++g_stats.shapeMatches;
+				LogSample(a_actor, a_high, off, static_cast<const LipSynchAnim*>(ptr));
+
+				Candidate c{ off, ptr, {} };
+				for (auto o = off + 8; o < off + 8 + kClockSearch; o += 4) {
+					const float v = Field<float>(a_high, o);
+					if (std::isfinite(v) && v >= 0.0f && v < 3600.0f) {
+						c.clocks.push_back({ o, v, 0, false });
 					}
 				}
-			}
-
-			if (!g_reportedNoLuck && a_now - g_discoveryStart > 30min) {
-				g_reportedNoLuck = true;
-				logger::warn("still haven't found the lip data after 30 minutes; the sync fix stays idle until it's found");
+				if (!c.clocks.empty()) {
+					probe.candidates.push_back(std::move(c));
+				}
 			}
 			return false;
 		}
@@ -559,7 +632,7 @@ namespace LipSync
 			state.last = now;
 
 			if (Settings::bFixLipTime) {
-				const auto step = Correct(state.lip, Field<float>(high, lipOffset + kLipTimeAfterAnim), realDt, Settings::fLipOffset);
+				const auto step = Correct(state.lip, Field<float>(high, g_lipTimeOffset.load()), realDt, Settings::fLipOffset);
 				state.engineAdvance += step.engine;
 				state.realAdvance += step.real;
 			}

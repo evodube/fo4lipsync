@@ -6,7 +6,7 @@ includes("extern/CommonLibF4")
 
 -- set project
 set_project("fo4lipsync")
-set_version("0.3.0")
+set_version("0.3.1")
 set_license("MIT")
 
 -- set defaults
