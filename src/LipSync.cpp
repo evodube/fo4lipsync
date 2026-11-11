@@ -30,10 +30,10 @@ namespace LipSync
 		static_assert(offsetof(LipSynchAnim, phonemes) == 0x20);
 		static_assert(sizeof(LipSynchAnim) == 0x48);
 
-		// HighProcessData fields we touch (AIProcess::high)
+		// HighProcessData fields on 1.11.x (AIProcess::high); used only as hints, the real
+		// lip offset is found at runtime (see Layout discovery)
 		constexpr std::ptrdiff_t kHigh_VoiceTimer = 0x3F0;
 		constexpr std::ptrdiff_t kHigh_LipSynchAnim = 0x4A0;
-		constexpr std::ptrdiff_t kHigh_LipTime = 0x4A8;
 		// Actor field
 		constexpr std::ptrdiff_t kActor_VoiceTimer = 0x38C;
 
@@ -207,6 +207,133 @@ namespace LipSync
 		}
 
 		// ------------------------------------------------------------------
+		// Layout discovery
+		// ------------------------------------------------------------------
+		//
+		// HighProcessData's layout differs between runtimes, so instead of trusting
+		// fixed offsets we find the lip data at runtime: scan a talking actor's
+		// HighProcessData for a pointer with LipSynchAnim's exact signature, then
+		// confirm it by watching the lip time stored right after it (+8) advance
+		// over several frames. Nothing is written until an offset is confirmed.
+
+		constexpr std::ptrdiff_t kScanBegin = 0x200;
+		constexpr std::ptrdiff_t kScanEnd = 0x800;
+		constexpr std::ptrdiff_t kLipTimeAfterAnim = 0x8;           // lipTime follows lipSynchAnim
+		constexpr std::ptrdiff_t kVoiceBeforeAnim = kHigh_LipSynchAnim - kHigh_VoiceTimer;  // 0xB0 on 1.11.x
+
+		std::atomic<std::ptrdiff_t> g_lipOffset{ -1 };    // confirmed lipSynchAnim offset
+		std::atomic<std::ptrdiff_t> g_voiceOffset{ -1 };  // confirmed voiceTimer offset
+		std::atomic<bool>           g_voiceGaveUp{ false };
+
+		// Stricter than PlausibleAnim: used while hunting through unknown fields.
+		bool LooksLikeLipAnim(const void* a_ptr)
+		{
+			if (!PlausiblePointer(a_ptr) || !Accessible(a_ptr, sizeof(LipSynchAnim), false)) {
+				return false;
+			}
+			const auto* anim = static_cast<const LipSynchAnim*>(a_ptr);
+			if (!PlausibleAnim(anim) || anim->numPhonemeTargets < 2 || anim->versionNumber > 64) {
+				return false;
+			}
+			if (!PlausiblePointer(anim->p_phonemes) || !PlausiblePointer(anim->phonemes) ||
+			    !Accessible(anim->p_phonemes, sizeof(float*) * 2, false) || anim->p_phonemes[0] != anim->phonemes) {
+				return false;
+			}
+			const auto stride = anim->p_phonemes[1] - anim->p_phonemes[0];
+			return stride == static_cast<std::ptrdiff_t>(anim->numFrames) ||
+			       stride == static_cast<std::ptrdiff_t>(anim->numPhonemeTargets);
+		}
+
+		struct Candidate
+		{
+			std::ptrdiff_t offset;
+			const void*    anim;
+			float          lipTime;
+			int            hits;
+		};
+
+		struct Probe
+		{
+			std::vector<Candidate> candidates;
+			clock::time_point      lastScan{};
+		};
+
+		std::unordered_map<RE::Actor*, Probe> g_probes;
+		clock::time_point                     g_lastAnyScan{};
+		clock::time_point                     g_discoveryStart{};
+		bool                                  g_reportedNoLuck{ false };
+
+		// Returns true once the lip offset is known.
+		bool Discover(RE::Actor* a_actor, void* a_high, clock::time_point a_now)
+		{
+			if (g_lipOffset >= 0) {
+				return true;
+			}
+			if (g_discoveryStart == clock::time_point{}) {
+				g_discoveryStart = a_now;
+			}
+
+			auto& probe = g_probes[a_actor];
+
+			// follow up on candidates from an earlier scan
+			if (!probe.candidates.empty()) {
+				std::erase_if(probe.candidates, [&](Candidate& c) {
+					const auto* anim = Field<const void*>(a_high, c.offset);
+					const float lip = Field<float>(a_high, c.offset + kLipTimeAfterAnim);
+					if (anim != c.anim || !std::isfinite(lip) || lip < c.lipTime - 0.001f || lip - c.lipTime > 1.0f) {
+						return true;  // line changed or the float isn't a forward-running clock
+					}
+					if (lip > c.lipTime) {
+						++c.hits;
+					}
+					c.lipTime = lip;
+					return false;
+				});
+
+				for (const auto& c : probe.candidates) {
+					if (c.hits >= 4) {
+						g_lipOffset = c.offset;
+						logger::info(
+							"found lip data at HighProcessData+0x{:X} (1.11.x layout has it at +0x{:X})",
+							c.offset, kHigh_LipSynchAnim);
+						g_probes.clear();
+						return true;
+					}
+				}
+				if (!probe.candidates.empty()) {
+					return false;
+				}
+			}
+
+			// scan this actor (throttled: one scan per actor per 0.25s, one per frame overall)
+			if (a_now - probe.lastScan < 250ms || a_now - g_lastAnyScan < 5ms) {
+				return false;
+			}
+			probe.lastScan = a_now;
+			g_lastAnyScan = a_now;
+
+			if (!Accessible(static_cast<std::byte*>(a_high) + kScanBegin, kScanEnd - kScanBegin, false)) {
+				return false;
+			}
+
+			for (auto off = kScanBegin; off + kLipTimeAfterAnim + 4 <= kScanEnd; off += 8) {
+				const auto* ptr = Field<const void*>(a_high, off);
+				if (LooksLikeLipAnim(ptr)) {
+					const float lip = Field<float>(a_high, off + kLipTimeAfterAnim);
+					if (std::isfinite(lip) && lip >= 0.0f && lip < 3600.0f) {
+						probe.candidates.push_back({ off, ptr, lip, 0 });
+					}
+				}
+			}
+
+			if (!g_reportedNoLuck && a_now - g_discoveryStart > 30min) {
+				g_reportedNoLuck = true;
+				logger::warn("still haven't found the lip data after 30 minutes; the sync fix stays idle until it's found");
+			}
+			return false;
+		}
+
+		// ------------------------------------------------------------------
 		// Real-time sync
 		// ------------------------------------------------------------------
 
@@ -217,27 +344,40 @@ namespace LipSync
 			bool  init{ false };
 		};
 
-		struct ActorState
+		// Watches a float we don't fully trust yet; it must tick like a timer
+		// (small, same-direction steps each frame) before we correct it.
+		struct Trial
 		{
-			LipSynchAnim*     anim{ nullptr };
-			clock::time_point last{};
-			clock::time_point lineStart{};
-			Track             lip;
-			Track             voice;
-			Track             actorVoice;
-			double            engineAdvance{ 0.0 };  // what the engine tried to add to lip time this line
-			double            realAdvance{ 0.0 };    // what we used instead
-			bool              smoothed{ false };
+			float last{ 0.0f };
+			int   hits{ 0 };
+			int   sign{ 0 };
+			bool  init{ false };
+			bool  failed{ false };
 		};
 
-		std::mutex                                       g_lock;
-		std::unordered_map<RE::Actor*, ActorState>       g_states;
-		std::atomic<bool>                                g_disabled{ false };
-		std::atomic<std::uint32_t>                       g_badSamples{ 0 };
-		std::uint64_t                                    g_lines{ 0 };
-		double                                           g_totalEngine{ 0.0 };
-		double                                           g_totalReal{ 0.0 };
-		std::uint64_t                                    g_smoothFailures{ 0 };
+		struct ActorState
+		{
+			const LipSynchAnim* anim{ nullptr };
+			bool                valid{ false };
+			clock::time_point   last{};
+			Track               lip;
+			Track               voice;
+			Track               actorVoice;
+			Trial               voiceTrial;
+			double              engineAdvance{ 0.0 };  // what the engine tried to add to lip time this line
+			double              realAdvance{ 0.0 };    // what we used instead
+			bool                smoothed{ false };
+		};
+
+		std::mutex                                 g_lock;
+		std::unordered_map<RE::Actor*, ActorState> g_states;
+		std::atomic<bool>                          g_disabled{ false };
+		std::uint32_t                              g_badLines{ 0 };
+		std::uint64_t                              g_lines{ 0 };
+		double                                     g_totalEngine{ 0.0 };
+		double                                     g_totalReal{ 0.0 };
+		std::uint64_t                              g_smoothFailures{ 0 };
+		std::uint32_t                              g_voiceTrialLines{ 0 };
 
 		struct Step
 		{
@@ -286,9 +426,42 @@ namespace LipSync
 			return { std::abs(engineDelta), real };
 		}
 
+		// Feeds one frame of a candidate voice timer; confirms it after steady ticking.
+		void TryVoiceOffset(ActorState& a_state, void* a_high, std::ptrdiff_t a_offset, float a_realDt)
+		{
+			auto& t = a_state.voiceTrial;
+			if (t.failed) {
+				return;
+			}
+			const float v = Field<float>(a_high, a_offset);
+			if (!std::isfinite(v) || v < -1.0f || v > 3600.0f) {
+				t.failed = true;
+				return;
+			}
+			if (!t.init) {
+				t = { v, 0, 0, true, false };
+				return;
+			}
+			const float d = v - t.last;
+			t.last = v;
+			if (d == 0.0f) {
+				return;
+			}
+			const int sign = d > 0.0f ? 1 : -1;
+			if (std::abs(d) > 0.5f || (t.sign != 0 && sign != t.sign) || a_realDt <= 0.0f || std::abs(d) > a_realDt * 6.0f) {
+				t.failed = true;
+				return;
+			}
+			t.sign = sign;
+			if (++t.hits >= 6) {
+				g_voiceOffset = a_offset;
+				logger::info("found voice timer at HighProcessData+0x{:X}", a_offset);
+			}
+		}
+
 		void FinishLine(RE::Actor* a_actor, const ActorState& a_state)
 		{
-			if (a_state.realAdvance <= 0.0) {
+			if (!a_state.valid || a_state.realAdvance <= 0.0) {
 				return;
 			}
 
@@ -316,11 +489,17 @@ namespace LipSync
 			if (!process || !process->high) {
 				return;
 			}
-
-			void* high = process->high;
-			auto* anim = Field<LipSynchAnim*>(high, kHigh_LipSynchAnim);
+			void*      high = process->high;
+			const auto now = clock::now();
 
 			std::scoped_lock lock(g_lock);
+
+			if (!Discover(a_actor, high, now)) {
+				return;
+			}
+
+			const auto lipOffset = g_lipOffset.load();
+			const auto* anim = Field<const LipSynchAnim*>(high, lipOffset);
 
 			if (!anim) {
 				if (const auto it = g_states.find(a_actor); it != g_states.end()) {
@@ -330,21 +509,7 @@ namespace LipSync
 				return;
 			}
 
-			// Validate each new line's lip data once before reading it.
-			const auto existing = g_states.find(a_actor);
-			const bool isNew = existing == g_states.end() || existing->second.anim != anim;
-			if (isNew && !(PlausiblePointer(anim) && Accessible(anim, sizeof(LipSynchAnim), false) && PlausibleAnim(anim))) {
-				if (g_badSamples.fetch_add(1) + 1 >= 20) {
-					g_disabled = true;
-					logger::error(
-						"lip data didn't match the expected layout for this game version 20 times in a row - turning the fix off for this session");
-				}
-				return;
-			}
-			g_badSamples = 0;
-
-			const auto now = clock::now();
-			auto&      state = g_states[a_actor];
+			auto& state = g_states[a_actor];
 
 			if (state.anim != anim) {
 				// new line started
@@ -354,16 +519,34 @@ namespace LipSync
 				state = {};
 				state.anim = anim;
 				state.last = now;
-				state.lineStart = now;
+				state.valid = LooksLikeLipAnim(anim);
+
+				if (!state.valid) {
+					if (++g_badLines >= 5) {
+						g_disabled = true;
+						logger::error("lip data stopped matching its expected layout 5 lines in a row - turning the fix off for this session");
+					}
+					return;
+				}
+				g_badLines = 0;
 
 				if (Settings::bSmoothMouth && Settings::fSmoothing > 0.0f) {
-					state.smoothed = SmoothAnim(anim);
+					state.smoothed = SmoothAnim(const_cast<LipSynchAnim*>(anim));
 					if (!state.smoothed && g_smoothFailures++ < 5) {
 						logger::warn(
 							"couldn't smooth lip data for actor {:08X} (frames {}, targets {}) - left as is",
 							a_actor->formID, anim->numFrames, anim->numPhonemeTargets);
 					}
 				}
+
+				if (Settings::bFixVoiceTimer && g_voiceOffset < 0 && !g_voiceGaveUp && ++g_voiceTrialLines > 10) {
+					g_voiceGaveUp = true;
+					logger::warn("couldn't confirm the voice timer after 10 lines; only lip time is being fixed");
+				}
+			}
+
+			if (!state.valid) {
+				return;
 			}
 
 			// Real time scaled by the game's slow-motion multiplier (VATS, Jet...),
@@ -376,13 +559,19 @@ namespace LipSync
 			state.last = now;
 
 			if (Settings::bFixLipTime) {
-				const auto step = Correct(state.lip, Field<float>(high, kHigh_LipTime), realDt, Settings::fLipOffset);
+				const auto step = Correct(state.lip, Field<float>(high, lipOffset + kLipTimeAfterAnim), realDt, Settings::fLipOffset);
 				state.engineAdvance += step.engine;
 				state.realAdvance += step.real;
 			}
+
 			if (Settings::bFixVoiceTimer) {
-				Correct(state.voice, Field<float>(high, kHigh_VoiceTimer), realDt);
+				if (const auto voiceOffset = g_voiceOffset.load(); voiceOffset >= 0) {
+					Correct(state.voice, Field<float>(high, voiceOffset), realDt);
+				} else if (!g_voiceGaveUp && lipOffset - kVoiceBeforeAnim >= 0) {
+					TryVoiceOffset(state, high, lipOffset - kVoiceBeforeAnim, realDt);
+				}
 			}
+
 			if (Settings::bFixActorVoiceTimer) {
 				Correct(state.actorVoice, Field<float>(a_actor, kActor_VoiceTimer), realDt);
 			}
