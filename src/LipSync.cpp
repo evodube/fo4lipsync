@@ -52,6 +52,42 @@ namespace LipSync
 			return p > 0x10000 && p < 0x7FFF'FFFF'FFFF && (p & 0x7) == 0;
 		}
 
+		// True when [a_ptr, a_ptr + a_size) is committed memory we may read (and write, if asked).
+		bool Accessible(const void* a_ptr, std::size_t a_size, bool a_write)
+		{
+			namespace W32 = REX::W32;
+
+			const auto p = reinterpret_cast<std::uintptr_t>(a_ptr);
+			if (p < 0x10000 || p >= 0x7FFF'FFFF'FFFF || (p & 0x3) != 0) {
+				return false;
+			}
+
+			auto       cur = reinterpret_cast<std::uintptr_t>(a_ptr);
+			const auto end = cur + a_size;
+			while (cur < end) {
+				W32::MEMORY_BASIC_INFORMATION mbi{};
+				if (W32::VirtualQuery(reinterpret_cast<const void*>(cur), &mbi, sizeof(mbi)) != sizeof(mbi)) {
+					return false;
+				}
+				if (mbi.state != W32::MEM_COMMIT || (mbi.protect & 0x100u) != 0) {  // 0x100 = PAGE_GUARD
+					return false;
+				}
+				const auto prot = mbi.protect & 0xFFu;
+				const bool readable = prot == W32::PAGE_READONLY || prot == W32::PAGE_READWRITE || prot == W32::PAGE_WRITECOPY ||
+				                      prot == W32::PAGE_EXECUTE_READ || prot == W32::PAGE_EXECUTE_READWRITE;
+				const bool writable = prot == W32::PAGE_READWRITE || prot == W32::PAGE_WRITECOPY || prot == W32::PAGE_EXECUTE_READWRITE;
+				if (!readable || (a_write && !writable)) {
+					return false;
+				}
+				const auto regionEnd = reinterpret_cast<std::uintptr_t>(mbi.baseAddress) + mbi.regionSize;
+				if (regionEnd <= cur) {
+					return false;
+				}
+				cur = regionEnd;
+			}
+			return true;
+		}
+
 		bool PlausibleAnim(const LipSynchAnim* a_anim)
 		{
 			return PlausiblePointer(a_anim) &&
@@ -130,7 +166,11 @@ namespace LipSync
 			if (frames < 3 || targets < 2 || frames == targets) {
 				return false;
 			}
-			if (!PlausiblePointer(rows) || !PlausiblePointer(base) || rows[0] != base) {
+			if (!PlausiblePointer(rows) || !PlausiblePointer(base) ||
+			    !Accessible(rows, sizeof(float*) * 2, false) || rows[0] != base) {
+				return false;
+			}
+			if (!Accessible(base, frames * targets * sizeof(float), true)) {
 				return false;
 			}
 
@@ -290,7 +330,10 @@ namespace LipSync
 				return;
 			}
 
-			if (!PlausibleAnim(anim)) {
+			// Validate each new line's lip data once before reading it.
+			const auto existing = g_states.find(a_actor);
+			const bool isNew = existing == g_states.end() || existing->second.anim != anim;
+			if (isNew && !(PlausiblePointer(anim) && Accessible(anim, sizeof(LipSynchAnim), false) && PlausibleAnim(anim))) {
 				if (g_badSamples.fetch_add(1) + 1 >= 20) {
 					g_disabled = true;
 					logger::error(
