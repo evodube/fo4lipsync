@@ -11,4 +11,4 @@ Requires F4SE and Address Library for F4SE Plugins.
 
 Build: apply `patches/commonlibf4-1.11-runtime.patch` to `extern/CommonLibF4` (`git -C extern/CommonLibF4 apply ../../patches/commonlibf4-1.11-runtime.patch`), then `xmake f -m releasedbg -y && xmake`. CI does both on every push to main.
 
-The patch fixes CommonLibF4 treating some 1.11.x builds (e.g. 1.11.137) as old-gen, which would load the wrong Address Library IDs.
+The patch makes CommonLibF4 treat every 1.11.x build as next-gen (it misread e.g. 1.11.137 as old-gen and loaded the wrong Address Library IDs), and adds the 1.11.137 Address Library and layout flags to the plugin's version data so Anniversary F4SE will load it.

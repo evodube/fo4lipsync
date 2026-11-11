@@ -11,3 +11,17 @@ index dbd105e5..591ce425 100644
  			}
  			return;
  		}
+diff --git a/CommonLibF4/xmake.lua b/CommonLibF4/xmake.lua
+index e7b3c5b6..635ddfe2 100644
+--- a/CommonLibF4/xmake.lua
++++ b/CommonLibF4/xmake.lua
+@@ -118,6 +118,9 @@ F4SE_EXPORT constinit auto F4SEPlugin_Version = []() noexcept {
+     v.UsesSigScanning(false);
+     v.IsLayoutDependent(true);
+     v.HasNoStructUse(false);
++    // also flag the 1.11.137+ Address Library and layout so 1.11.x F4SE loads the plugin
++    v.addressIndependence |= (1 << 1) | (1 << 2);
++    v.structureIndependence |= (1 << 1) | (1 << 2);
+     v.CompatibleVersions({ F4SE::RUNTIME_LATEST });
+     return v;
+ }();
